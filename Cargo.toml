@@ -1,0 +1,15 @@
+[package]
+name = "smolvlm"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ort = "=2.0.0-rc.9"
+image = "0.24"
+clap = { version = "4.4", features = ["derive"] }
+ndarray = "0.16.1"
+tokenizers = { version = "0.21.1" }
+anyhow       = "1.0"
+tokio        = { version = "1", features = ["rt-multi-thread","macros"] }
+reqwest      = { version = "0.11", features = ["json","blocking"] }
+ndarray-npy = "0.9.1"

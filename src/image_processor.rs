@@ -1,6 +1,6 @@
 use anyhow::Result;
 use image::{DynamicImage, GenericImageView};
-use ndarray::{Array2, Array4, Array5};
+use ndarray::{Array4, Array5};
 use std::collections::HashMap;
 
 const MAX_IMAGE_SIZE: u32 = 4096; // 4k resolution as absolute maximum

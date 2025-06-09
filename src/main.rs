@@ -13,6 +13,7 @@ use ort::{
 use reqwest::blocking::Client;
 use std::path::PathBuf;
 use std::fs;
+use std::io::Write;
 use tokenizers::Tokenizer;
 use std::collections::HashMap;
 
@@ -181,9 +182,12 @@ impl SmolVLM {
         let mut vision_inputs: HashMap<&str, Value> = HashMap::new();
         
         // Convert the processed image tuple into separate values
-        let (processed_image, attention_mask) = processed_image;
-        vision_inputs.insert("pixel_values", Value::from_array(processed_image)?.into());
-        vision_inputs.insert("pixel_attention_mask", Value::from_array(attention_mask)?.into());
+        let (processed_image, pixel_attention_mask) = processed_image;
+        vision_inputs.insert("pixel_values", Value::from_array(processed_image.clone())?.into());
+        
+        // Convert attention mask to boolean while maintaining shape (batch, num_frames, height, width)
+        let pixel_attention_mask_bool = pixel_attention_mask.map(|&x| x != 0);
+        vision_inputs.insert("pixel_attention_mask", Value::from_array(pixel_attention_mask_bool.clone())?.into());
         
         let vision_outputs = self.vision_session.run(vision_inputs)?;
         let image_features = vision_outputs[0].try_extract_tensor::<f32>()?.to_owned();
@@ -191,64 +195,47 @@ impl SmolVLM {
         // 6. Generation loop
         let max_new_tokens = 1024;
         let mut generated_tokens = Vec::new();
-        let mut position_ids: Vec<u32> = (0..current_input_ids.len() as u32).collect();
+        let mut input_ids = Array::from_vec(input_ids.iter().map(|&x| x as i64).collect())
+            .into_shape_with_order((1, input_ids.len()))?
+            .into_owned();
+        let mut attention_mask = Array::from_vec(attention_mask.iter().map(|&x| x as i64).collect())
+            .into_shape_with_order((1, attention_mask.len()))?
+            .into_owned();
+        let mut position_ids = Array::from_vec((0..input_ids.len()).map(|x| x as i64).collect())
+            .into_shape_with_order((1, input_ids.len()))?
+            .into_owned();
+        let mut image_features = None;
 
         for _ in 0..max_new_tokens {
             // Get input embeddings
-            let mut embed_inputs = HashMap::new();
-            let input_ids_i64: Vec<i64> = current_input_ids.iter().map(|&x| x as i64).collect();
-            let len = input_ids_i64.len();
-            let input_ids_array = Array::from_vec(input_ids_i64)
-                .into_shape((1, len))?
-                .into_owned();
-            embed_inputs.insert("input_ids", Value::from_array(input_ids_array.clone())?);
-            
-            println!("\nEmbedding model input:");
-            println!("input_ids shape: {:?}", input_ids_array.shape());
-            println!("input_ids type: i64");
-            
+            let mut embed_inputs: HashMap<&str, Value> = HashMap::new();
+            embed_inputs.insert("input_ids", Value::from_array(input_ids.clone())?.into());
             let embed_outputs = self.embed_session.run(embed_inputs)?;
             let mut input_embeds = embed_outputs[0].try_extract_tensor::<f32>()?.to_owned();
-            
-            println!("Embedding model output:");
-            println!("embeddings shape: {:?}", input_embeds.shape());
-            println!("embeddings type: f32");
+
+            // Only compute vision features if not already computed
+            if image_features.is_none() {
+                let mut vision_inputs: HashMap<&str, Value> = HashMap::new();
+                vision_inputs.insert("pixel_values", Value::from_array(processed_image.clone())?.into());
+                vision_inputs.insert("pixel_attention_mask", Value::from_array(pixel_attention_mask_bool.clone())?.into());
+                
+                let vision_outputs = self.vision_session.run(vision_inputs)?;
+                image_features = Some(vision_outputs[0].try_extract_tensor::<f32>()?.to_owned());
+            }
 
             // Replace image token embeddings with image features
-            for (i, &token_id) in current_input_ids.iter().enumerate() {
-                if token_id == self.config.image_token_id {
-                    let mut slice = input_embeds.slice_mut(ndarray::s![i, ..]);
-                    slice.assign(&image_features.slice(ndarray::s![0, ..]));
+            for i in 0..input_ids.shape()[1] {
+                if input_ids[[0, i]] == self.config.image_token_id as i64 {
+                    let mut slice = input_embeds.slice_mut(ndarray::s![0, i, ..]);
+                    slice.assign(&image_features.as_ref().unwrap().slice(ndarray::s![0, ..]));
                 }
             }
 
             // Prepare decoder inputs
             let mut decoder_inputs: HashMap<&str, Value> = HashMap::new();
-            
-            // inputs_embeds is f32
             decoder_inputs.insert("inputs_embeds", Value::from_array(input_embeds.clone())?.into());
-            
-            println!("\nDecoder model inputs:");
-            println!("inputs_embeds shape: {:?}", input_embeds.shape());
-            println!("inputs_embeds type: f32");
-            
-            // attention_mask is i64
-            let attention_mask_i64: Vec<i64> = current_attention_mask.iter().map(|&x| x as i64).collect();
-            let attention_mask_array = Array::from_vec(attention_mask_i64)
-                .to_shape((1, current_attention_mask.len()))?.into_owned();
-            decoder_inputs.insert("attention_mask", Value::from_array(attention_mask_array.clone())?.into());
-            
-            println!("attention_mask shape: {:?}", attention_mask_array.shape());
-            println!("attention_mask type: i64");
-            
-            // position_ids is i64
-            let position_ids_i64: Vec<i64> = position_ids.iter().map(|&x| x as i64).collect();
-            let position_ids_array = Array::from_vec(position_ids_i64)
-                .to_shape((1, position_ids.len()))?.into_owned();
-            decoder_inputs.insert("position_ids", Value::from_array(position_ids_array.clone())?.into());
-            
-            println!("position_ids shape: {:?}", position_ids_array.shape());
-            println!("position_ids type: i64");
+            decoder_inputs.insert("attention_mask", Value::from_array(attention_mask.clone())?.into());
+            decoder_inputs.insert("position_ids", Value::from_array(position_ids.clone())?.into());
             
             // Add past key values
             for (key, value) in &past_key_values {
@@ -257,49 +244,68 @@ impl SmolVLM {
 
             // Run decoder
             let decoder_outputs = self.decoder_session.run(decoder_inputs)?;
-
-            // Get logits and update past key values
             let logits = decoder_outputs[0].try_extract_tensor::<f32>()?.to_owned();
-            let present_key_values = decoder_outputs[1].try_extract_tensor::<f32>()?.to_owned();
-
-            println!("\nPresent key values shape: {:?}", present_key_values.shape());
-
-            // Get next token
-            let logits_slice = logits.slice(ndarray::s![-1, ..]);
+            
+            // Get next token from last position
+            let last_idx = logits.shape()[1] - 1;
+            let logits_slice = logits.slice(ndarray::s![0, last_idx, ..]);
             let next_token = logits_slice.iter()
                 .enumerate()
                 .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                .map(|(i, _)| i as u32)
+                .map(|(i, _)| i as i64)
                 .ok_or_else(|| anyhow::anyhow!("Failed to find max logit"))?;
             
-            generated_tokens.push(next_token);
+            // Update inputs for next iteration
+            input_ids = Array::from_vec(vec![next_token]).into_shape_with_order((1, 1))?;
+            attention_mask = Array::ones((1, 1));
+            position_ids = position_ids.slice(ndarray::s![.., -1..]).map(|&x| x + 1);
+
+            // Update past key values - handle each layer's key and value separately
+            for i in 0..self.config.num_hidden_layers {
+                let key = format!("past_key_values.{}.key", i);
+                let value = format!("past_key_values.{}.value", i);
+                
+                if let Some(past_key) = past_key_values.get_mut(&key) {
+                    let present_key = decoder_outputs[i * 2 + 1].try_extract_tensor::<f32>()?.to_owned();
+                    // Instead of assigning, we need to concatenate along the sequence dimension
+                    let new_shape = (past_key.shape()[0], past_key.shape()[1], past_key.shape()[2] + present_key.shape()[2], past_key.shape()[3]);
+                    let mut new_key = Array::zeros(new_shape);
+                    // Copy existing past key values
+                    new_key.slice_mut(ndarray::s![.., .., ..past_key.shape()[2], ..]).assign(past_key);
+                    // Copy new key values
+                    new_key.slice_mut(ndarray::s![.., .., past_key.shape()[2].., ..]).assign(&present_key);
+                    *past_key = new_key;
+                }
+                
+                if let Some(past_value) = past_key_values.get_mut(&value) {
+                    let present_value = decoder_outputs[i * 2 + 2].try_extract_tensor::<f32>()?.to_owned();
+                    // Similarly for values, concatenate along sequence dimension
+                    let new_shape = (past_value.shape()[0], past_value.shape()[1], past_value.shape()[2] + present_value.shape()[2], past_value.shape()[3]);
+                    let mut new_value = Array::zeros(new_shape);
+                    // Copy existing past values
+                    new_value.slice_mut(ndarray::s![.., .., ..past_value.shape()[2], ..]).assign(past_value);
+                    // Copy new values
+                    new_value.slice_mut(ndarray::s![.., .., past_value.shape()[2].., ..]).assign(&present_value);
+                    *past_value = new_value;
+                }
+            }
+
+            // Add to generated tokens
+            generated_tokens.push(next_token as u32);
+            std::io::stdout().flush()?;  // Ensure the dot is printed immediately
 
             // Check for EOS token
-            if next_token == self.config.eos_token_id {
+            if next_token == self.config.eos_token_id as i64 {
+                println!("\nGeneration complete!");  // New line after completion
                 break;
             }
 
-            // Update inputs for next iteration
-            current_input_ids = vec![next_token];
-            current_attention_mask = vec![1];
-            position_ids = vec![position_ids.last().unwrap() + 1];
-
-            // Update past key values
-            for i in 0..self.config.num_hidden_layers {
-                for kv in &["key", "value"] {
-                    let key = format!("past_key_values.{}.{}", i, kv);
-                    if let Some(value) = past_key_values.get_mut(&key) {
-                        // Get the appropriate slice based on whether it's a key or value
-                        let present_slice = if *kv == "key" {
-                            present_key_values.slice(ndarray::s![0, i, .., ..])
-                        } else {
-                            present_key_values.slice(ndarray::s![0, i, .., ..])
-                        };
-                        value.assign(&present_slice);
-                    }
-                }
+            // Print token as we generate (streaming)
+            if let Ok(token_str) = self.processor.decode(&[next_token as u32], true) {
+                print!("{}", token_str);
             }
         }
+        println!();
 
         // 7. Decode the generated tokens
         let generated_text = self.processor.decode(&generated_tokens, true)

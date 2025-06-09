@@ -132,6 +132,39 @@ fn test_boat_image_processing() {
         .fold(0.0, f32::max);
     
     println!("Maximum difference between Rust and Python pixel values: {}", max_diff);
+
+    // Print first frame statistics (slice) and first few pixel values (for debugging)
+    let binding_rust = pixel_values.index_axis(ndarray::Axis(0), 0);
+    let rust_first_frame = binding_rust.index_axis(ndarray::Axis(0), 0);
+    let binding_py = python_pixel_values.index_axis(ndarray::Axis(0), 0);
+    let py_first_frame = binding_py.index_axis(ndarray::Axis(0), 0);
+    println!("\nRust First Frame (slice) statistics:");
+    println!("min: {}", rust_first_frame.iter().fold(f32::INFINITY, |a, &b| a.min(b)));
+    println!("max: {}", rust_first_frame.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b)));
+    println!("mean: {}", rust_first_frame.mean().unwrap());
+    println!("std: {}", (rust_first_frame.var(1.0)).sqrt());
+    println!("\nPython First Frame (slice) statistics:");
+    println!("min: {}", py_first_frame.iter().fold(f32::INFINITY, |a, &b| a.min(b)));
+    println!("max: {}", py_first_frame.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b)));
+    println!("mean: {}", py_first_frame.mean().unwrap());
+    println!("std: {}", (py_first_frame.var(1.0)).sqrt());
+    println!("\nRust First Frame (slice) first few pixel values (channels 0,1,2, positions (0,0)–(2,2)):");
+    for c in 0..3 {
+        for y in 0..3 {
+            for x in 0..3 {
+                println!("Channel {}, Position ({}, {}): {}", c, y, x, rust_first_frame[[c, y, x]]);
+            }
+        }
+    }
+    println!("\nPython First Frame (slice) first few pixel values (channels 0,1,2, positions (0,0)–(2,2)):");
+    for c in 0..3 {
+        for y in 0..3 {
+            for x in 0..3 {
+                println!("Channel {}, Position ({}, {}): {}", c, y, x, py_first_frame[[c, y, x]]);
+            }
+        }
+    }
+
     assert!(max_diff < 1e-5, "Pixel values differ too much from Python implementation");
 
     // Compare attention masks
@@ -140,13 +173,13 @@ fn test_boat_image_processing() {
         .all(|(a, b)| *a == *b);
     assert!(mask_matches, "Attention masks don't match Python implementation");
 
-    // Print statistics for debugging
+    // Print statistics for debugging (overall)
     let min = pixel_values.iter().fold(f32::INFINITY, |a, &b| a.min(b));
     let max = pixel_values.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
     let mean = pixel_values.mean().unwrap();
     let std = (pixel_values.var(1.0)).sqrt();
 
-    println!("\nRust Output:");
+    println!("\nRust Output (overall):");
     println!("pixel_values shape: {:?}", pixel_values.shape());
     println!("pixel_attention_mask shape: {:?}", pixel_attention_mask.shape());
     println!("\npixel_values min: {}", min);
@@ -154,13 +187,13 @@ fn test_boat_image_processing() {
     println!("pixel_values mean: {}", mean);
     println!("pixel_values std: {}", std);
 
-    // Print Python statistics for comparison
+    // Print Python statistics for comparison (overall)
     let py_min = python_pixel_values.iter().fold(f32::INFINITY, |a, &b| a.min(b));
     let py_max = python_pixel_values.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
     let py_mean = python_pixel_values.mean().unwrap();
     let py_std = (python_pixel_values.var(1.0)).sqrt();
 
-    println!("\nPython Output:");
+    println!("\nPython Output (overall):");
     println!("pixel_values min: {}", py_min);
     println!("pixel_values max: {}", py_max);
     println!("pixel_values mean: {}", py_mean);

@@ -4,8 +4,8 @@ use ndarray::{Array2, Array4, Array5};
 use std::collections::HashMap;
 
 const MAX_IMAGE_SIZE: u32 = 4096; // 4k resolution as absolute maximum
-const IDEFICS3_MEAN: [f32; 3] = [0.48145466, 0.4578275, 0.40821073];
-const IDEFICS3_STD: [f32; 3] = [0.26862954, 0.26130258, 0.27577711];
+const SMOLVLM_MEAN: [f32; 3] = [0.5, 0.5, 0.5];
+const SMOLVLM_STD: [f32; 3] = [0.5, 0.5, 0.5];
 
 #[derive(Debug, Clone)]
 pub struct SmolVLMImageProcessor {
@@ -27,14 +27,14 @@ impl Default for SmolVLMImageProcessor {
         Self {
             do_convert_rgb: true,
             do_resize: true,
-            size: HashMap::from([("longest_edge".to_string(), 512)]),
+            size: HashMap::from([("longest_edge".to_string(), 2048)]),
             do_image_splitting: true,
             max_image_size: HashMap::from([("longest_edge".to_string(), 512)]),
             do_rescale: true,
             rescale_factor: 1.0 / 255.0,
             do_normalize: true,
-            image_mean: IDEFICS3_MEAN,
-            image_std: IDEFICS3_STD,
+            image_mean: SMOLVLM_MEAN,
+            image_std: SMOLVLM_STD,
             do_pad: true,
         }
     }
@@ -104,6 +104,11 @@ impl SmolVLMImageProcessor {
         resolution_max_side: u32,
     ) -> (u32, u32) {
         let (height, width) = (image.height(), image.width());
+        
+        // Only resize if the image is larger than resolution_max_side
+        if height <= resolution_max_side && width <= resolution_max_side {
+            return (height, width);
+        }
 
         // Find the output size, when rescaling the longest edge to max_len and preserving the aspect ratio
         let (height, width) = Self::resize_output_size_rescale_to_max_len(height, width, None, Some(resolution_max_side));
@@ -138,45 +143,54 @@ impl SmolVLMImageProcessor {
         let (height, width) = (image.height(), image.width());
         let max_size = max_image_size.get("longest_edge").unwrap_or(&512);
 
-        println!("Original image size: {}x{}", width, height);
-        println!("Max size: {}", max_size);
-
         let mut frames = Vec::new();
         
-        // Always split into a 4x4 grid (16 frames) plus the original image
-        let num_splits_h = 4;
-        let num_splits_w = 4;
-        let optimal_height = (height as f32 / num_splits_h as f32).ceil() as u32;
-        let optimal_width = (width as f32 / num_splits_w as f32).ceil() as u32;
+        // Always do a 4x4 split if image is >= max_size
+        if height >= *max_size || width >= *max_size {
+            // Force 4x4 split
+            let num_splits_h = 4;
+            let num_splits_w = 4;
+            
+            // Calculate optimal split sizes
+            let optimal_height = (height as f32 / num_splits_h as f32).ceil() as u32;
+            let optimal_width = (width as f32 / num_splits_w as f32).ceil() as u32;
 
-        println!("Splitting into {}x{} grid", num_splits_w, num_splits_h);
-        println!("Optimal split size: {}x{}", optimal_width, optimal_height);
+            for r in 0..num_splits_h {
+                for c in 0..num_splits_w {
+                    let start_x = c * optimal_width;
+                    let start_y = r * optimal_height;
+                    let end_x = (start_x + optimal_width).min(width);
+                    let end_y = (start_y + optimal_height).min(height);
 
-        for r in 0..num_splits_h {
-            for c in 0..num_splits_w {
-                let start_x = c * optimal_width;
-                let start_y = r * optimal_height;
-                let end_x = (start_x + optimal_width).min(width);
-                let end_y = (start_y + optimal_height).min(height);
-
-                let cropped = image.crop_imm(start_x, start_y, end_x - start_x, end_y - start_y);
-                frames.push(cropped);
+                    let cropped = image.crop_imm(start_x, start_y, end_x - start_x, end_y - start_y);
+                    // Resize each cropped frame to max_size x max_size
+                    let resized = self.resize(
+                        cropped,
+                        HashMap::from([
+                            ("height".to_string(), *max_size),
+                            ("width".to_string(), *max_size),
+                        ]),
+                    )?;
+                    frames.push(resized);
+                }
             }
         }
 
-        // Add the resized original image
-        let resized = self.resize(
-            image,
-            HashMap::from([
-                ("height".to_string(), *max_size),
-                ("width".to_string(), *max_size),
-            ]),
-        )?;
+        // Add the original image, only resize if needed
+        let resized = if height > *max_size || width > *max_size {
+            self.resize(
+                image,
+                HashMap::from([
+                    ("height".to_string(), *max_size),
+                    ("width".to_string(), *max_size),
+                ]),
+            )?
+        } else {
+            image
+        };
         frames.push(resized);
 
-        println!("Total frames after splitting: {}", frames.len());
-
-        Ok((frames, num_splits_h, num_splits_w))
+        Ok((frames, 4, 4))  // Always return 4x4 for the split dimensions
     }
 
     pub fn preprocess(&self, image: DynamicImage) -> Result<(Array5<f32>, Array4<i64>)> {
@@ -187,39 +201,51 @@ impl SmolVLMImageProcessor {
             image = self.convert_to_rgb(image);
         }
 
-        // Resize if needed
+        // Resize if needed - first resize to size["longest_edge"] while preserving aspect ratio
         if self.do_resize {
             image = self.resize(image, self.size.clone())?;
         }
 
-        // Split image if needed - always do 4x4 grid plus original
-        let (frames, _, _) = if self.do_image_splitting {
-            self.split_image(image, &self.max_image_size)?
+        // Split image if needed
+        let (frames, num_splits_h, num_splits_w) = if self.do_image_splitting {
+            // First resize to be multiples of max_image_size while preserving aspect ratio
+            let max_size = self.max_image_size.get("longest_edge").unwrap_or(&512);
+            let (height, width) = (image.height(), image.width());
+            let aspect_ratio = width as f32 / height as f32;
+            
+            let (new_width, new_height) = if width >= height {
+                let new_width = ((width as f32 / *max_size as f32).ceil() * *max_size as f32) as u32;
+                let new_height = (new_width as f32 / aspect_ratio).round() as u32;
+                let new_height = ((new_height as f32 / *max_size as f32).ceil() * *max_size as f32) as u32;
+                (new_width, new_height)
+            } else {
+                let new_height = ((height as f32 / *max_size as f32).ceil() * *max_size as f32) as u32;
+                let new_width = (new_height as f32 * aspect_ratio).round() as u32;
+                let new_width = ((new_width as f32 / *max_size as f32).ceil() * *max_size as f32) as u32;
+                (new_width, new_height)
+            };
+
+            let resized = self.resize(
+                image,
+                HashMap::from([
+                    ("height".to_string(), new_height),
+                    ("width".to_string(), new_width),
+                ]),
+            )?;
+            
+            self.split_image(resized, &self.max_image_size)?
         } else {
-            (vec![image], 0, 0)
+            // If not splitting, just resize to max_image_size
+            let max_size = self.max_image_size.get("longest_edge").unwrap_or(&512);
+            let resized = self.resize(
+                image,
+                HashMap::from([
+                    ("height".to_string(), *max_size),
+                    ("width".to_string(), *max_size),
+                ]),
+            )?;
+            (vec![resized], 0, 0)
         };
-
-        println!("Number of frames before resizing: {}", frames.len());
-
-        // Ensure all frames have the same dimensions
-        let max_size = self.max_image_size.get("longest_edge").unwrap_or(&512);
-        let frames: Vec<DynamicImage> = frames.into_iter()
-            .map(|frame| {
-                if frame.width() != *max_size || frame.height() != *max_size {
-                    self.resize(
-                        frame.clone(),
-                        HashMap::from([
-                            ("height".to_string(), *max_size),
-                            ("width".to_string(), *max_size),
-                        ]),
-                    ).unwrap_or(frame)
-                } else {
-                    frame
-                }
-            })
-            .collect();
-
-        println!("Number of frames after resizing: {}", frames.len());
 
         // Convert frames to arrays and normalize
         let mut processed_frames = Vec::new();
@@ -254,14 +280,10 @@ impl SmolVLMImageProcessor {
             },
         );
 
-        println!("Final batch shape: {:?}", batch.shape());
-
         // Create attention mask with shape (batch, num_frames, height, width)
         let height = processed_frames[0].shape()[3];
         let width = processed_frames[0].shape()[4];
         let attention_mask = Array4::ones((1, processed_frames.len(), height, width));
-
-        println!("Final attention mask shape: {:?}", attention_mask.shape());
 
         Ok((batch, attention_mask))
     }

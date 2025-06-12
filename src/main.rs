@@ -246,31 +246,6 @@ impl SmolVLM {
         // Replace the <image> token in the text with our expanded prompt
         let prompt = text.replace("<image>", &image_prompt);
         
-        // Debug: Print the first few lines of the prompt to verify structure
-        println!("\nFirst few lines of expanded prompt:");
-        for (i, line) in prompt.lines().take(5).enumerate() {
-            println!("Line {}: {}", i + 1, line);
-        }
-        
-        // Debug: Count tokens
-        let encoding = self.processor.encode(&*prompt, true)
-            .map_err(|e| anyhow::anyhow!("Tokenization error: {}", e))?;
-        let input_ids = encoding.get_ids();
-        println!("\nTotal tokens: {}", input_ids.len());
-        println!("Number of <image> tokens: {}", input_ids.iter().filter(|&&id| id == self.config.image_token_id as u32).count());
-        
-        // Debug: Print all unique tokens and their IDs
-        println!("\nUnique tokens in prompt:");
-        let mut seen_tokens = std::collections::HashSet::new();
-        for &id in input_ids {
-            if !seen_tokens.contains(&id) {
-                if let Ok(token) = self.processor.decode(&[id], true) {
-                    println!("Token ID {}: '{}'", id, token);
-                    seen_tokens.insert(id);
-                }
-            }
-        }
-        
         Ok((prompt, (processed_image, pixel_attention_mask)))
     }
 
@@ -317,6 +292,12 @@ impl SmolVLM {
         
         let vision_outputs = self.vision_session.run(vision_inputs)?;
         let image_features = vision_outputs[0].try_extract_tensor::<f32>()?.to_owned();
+        println!("Image features shape: {:?}", image_features.shape());
+        
+        // Calculate total size for first dimension (17 * 64 = 1088)
+        let total_size = image_features.shape()[0] * image_features.shape()[1];
+        let image_features_reshaped = image_features.into_shape_with_order((total_size, 960))?;
+        println!("Reshaped features shape: {:?}", image_features_reshaped.shape());
 
         // 6. Generation loop
         let max_new_tokens = 1024;
@@ -330,7 +311,6 @@ impl SmolVLM {
         let mut position_ids = Array::from_vec((0..input_ids.len()).map(|x| x as i64).collect())
             .into_shape_with_order((1, input_ids.len()))?
             .into_owned();
-        let mut image_features = None;
 
         for _ in 0..max_new_tokens {
             // Get input embeddings
@@ -339,21 +319,13 @@ impl SmolVLM {
             let embed_outputs = self.embed_session.run(embed_inputs)?;
             let mut input_embeds = embed_outputs[0].try_extract_tensor::<f32>()?.to_owned();
 
-            // Only compute vision features if not already computed
-            if image_features.is_none() {
-                let mut vision_inputs: HashMap<&str, Value> = HashMap::new();
-                vision_inputs.insert("pixel_values", Value::from_array(processed_image.clone())?.into());
-                vision_inputs.insert("pixel_attention_mask", Value::from_array(pixel_attention_mask_bool.clone())?.into());
-                
-                let vision_outputs = self.vision_session.run(vision_inputs)?;
-                image_features = Some(vision_outputs[0].try_extract_tensor::<f32>()?.to_owned());
-            }
-
             // Replace image token embeddings with image features
+            let mut feature_idx = 0;
             for i in 0..input_ids.shape()[1] {
                 if input_ids[[0, i]] == self.config.image_token_id as i64 {
                     let mut slice = input_embeds.slice_mut(ndarray::s![0, i, ..]);
-                    slice.assign(&image_features.as_ref().unwrap().slice(ndarray::s![0, ..]));
+                    slice.assign(&image_features_reshaped.slice(ndarray::s![feature_idx, ..]));
+                    feature_idx += 1;
                 }
             }
 

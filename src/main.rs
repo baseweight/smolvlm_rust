@@ -5,7 +5,7 @@ mod tests;
 use anyhow::{Result, Context};
 use clap::Parser;
 use image::DynamicImage;
-use ndarray::Array;
+use ndarray::{Array, Array4, Array5};
 use ort::{
     session::{Session, builder::GraphOptimizationLevel},
     value::Value,
@@ -49,7 +49,7 @@ struct Args {
     image_path: PathBuf,
 
     /// Prompt to use for generation
-    #[arg(long, default_value = "Can you describe this image?")]
+    #[arg(long, default_value = "<image>Can you describe this image?")]
     prompt: String,
 }
 
@@ -114,13 +114,24 @@ impl SmolVLM {
             .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
         let image_processor = SmolVLMImageProcessor::new();
 
+        // Get special tokens from tokenizer
+        let image_token = "<image>";
+        let eos_token = "<end_of_utterance>";  // This is for SmolVLM2
+        let image_token_id = processor.token_to_id(image_token)
+            .ok_or_else(|| anyhow::anyhow!("Failed to get image token ID"))?;
+        let eos_token_id = processor.token_to_id(eos_token)
+            .ok_or_else(|| anyhow::anyhow!("Failed to get EOS token ID"))?;
+
+        println!("Image token ID: {}", image_token_id);
+        println!("EOS token ID: {}", eos_token_id);
+
         // Use configuration that matches the model's expectations
         let config = SmolVLMConfig {
             num_key_value_heads: 5,
             head_dim: 64,
             num_hidden_layers: 32,
-            eos_token_id: 2,
-            image_token_id: 49190,
+            eos_token_id,
+            image_token_id,
             max_context_length: 2048,
         };
 
@@ -147,22 +158,137 @@ impl SmolVLM {
         }
     }
 
-    fn generate(&self, prompt: &str, image: DynamicImage) -> Result<String> {
-        // 1. Process the image
-        let processed_image = self.image_processor.preprocess(image)?;
+    fn prompt_split_image(
+        image_seq_len: usize,
+        image_rows: usize,
+        image_cols: usize,
+        fake_token_around_image: &str,
+        image_token: &str,
+        global_image_token: &str,
+    ) -> String {
+        let mut text_split_images = String::new();
         
-        // 2. Create the chat template
-        let messages = format!(
-            r#"<|im_start|>user
-<|im_start|>image<|im_end|>
-<|im_start|>text
-{prompt}<|im_end|>
-<|im_start|>assistant
-"#
+        // Create the 4x4 grid
+        for n_h in 0..image_rows {
+            for n_w in 0..image_cols {
+                text_split_images.push_str(&format!(
+                    "{}{}<row_{}_col_{}>{}{}",
+                    fake_token_around_image,
+                    "<row_",
+                    n_h + 1,
+                    n_w + 1,
+                    ">",
+                    image_token.repeat(image_seq_len)
+                ));
+            }
+            text_split_images.push('\n');
+        }
+
+        // Add global image section
+        text_split_images.push_str(&format!(
+            "\n{}{}{}{}",
+            fake_token_around_image,
+            global_image_token,
+            image_token.repeat(image_seq_len),
+            fake_token_around_image
+        ));
+
+        text_split_images
+    }
+
+    fn get_image_prompt_string(
+        image_rows: usize,
+        image_cols: usize,
+        image_seq_len: usize,
+        fake_token_around_image: &str,
+        image_token: &str,
+        global_image_token: &str,
+    ) -> String {
+        if image_rows == 0 && image_cols == 0 {
+            // Single image case
+            format!(
+                "{}{}{}{}",
+                fake_token_around_image,
+                global_image_token,
+                image_token.repeat(image_seq_len),
+                fake_token_around_image
+            )
+        } else {
+            // Grid case
+            SmolVLM::prompt_split_image(
+                image_seq_len,
+                image_rows,
+                image_cols,
+                fake_token_around_image,
+                image_token,
+                global_image_token,
+            )
+        }
+    }
+
+    fn process_vision(
+        &self,
+        text: &str,
+        image: DynamicImage,
+    ) -> Result<(String, (Array5<f32>, Array4<i64>))> {
+        // Process the image
+        let (processed_image, pixel_attention_mask) = self.image_processor.preprocess(image)?;
+        
+        // Use 4x4 grid (matching our image processor)
+        let image_rows = 4;
+        let image_cols = 4;
+        let image_seq_len = 169; // Updated to match Python version
+        
+        println!("Image dimensions: {}x{}", processed_image.shape()[3], processed_image.shape()[4]);
+        println!("Pixel attention mask shape: {:?}", pixel_attention_mask.shape());
+        
+        // Get the image prompt string
+        let image_prompt = SmolVLM::get_image_prompt_string(
+            image_rows,
+            image_cols,
+            image_seq_len,
+            "<fake_token_around_image>",
+            "<image>",
+            "<global-img>",
         );
         
-        // 3. Tokenize the input
-        let encoding = self.processor.encode(messages, true)
+        // Replace the <image> token in the text with our expanded prompt
+        let prompt = text.replace("<image>", &image_prompt);
+        
+        // Debug: Print the first few lines of the prompt to verify structure
+        println!("\nFirst few lines of expanded prompt:");
+        for (i, line) in prompt.lines().take(5).enumerate() {
+            println!("Line {}: {}", i + 1, line);
+        }
+        
+        // Debug: Count tokens
+        let encoding = self.processor.encode(&*prompt, true)
+            .map_err(|e| anyhow::anyhow!("Tokenization error: {}", e))?;
+        let input_ids = encoding.get_ids();
+        println!("\nTotal tokens: {}", input_ids.len());
+        println!("Number of <image> tokens: {}", input_ids.iter().filter(|&&id| id == self.config.image_token_id as u32).count());
+        
+        // Debug: Print all unique tokens and their IDs
+        println!("\nUnique tokens in prompt:");
+        let mut seen_tokens = std::collections::HashSet::new();
+        for &id in input_ids {
+            if !seen_tokens.contains(&id) {
+                if let Ok(token) = self.processor.decode(&[id], true) {
+                    println!("Token ID {}: '{}'", id, token);
+                    seen_tokens.insert(id);
+                }
+            }
+        }
+        
+        Ok((prompt, (processed_image, pixel_attention_mask)))
+    }
+
+    fn generate(&self, prompt: &str, image: DynamicImage) -> Result<String> {
+        // Process the image and get the expanded prompt
+        let (expanded_prompt, (processed_image, pixel_attention_mask)) = self.process_vision(prompt, image)?;
+        
+        // Tokenize the expanded prompt
+        let encoding = self.processor.encode(expanded_prompt, true)
             .map_err(|e| anyhow::anyhow!("Tokenization error: {}", e))?;
         let input_ids = encoding.get_ids();
         let attention_mask = encoding.get_attention_mask();
@@ -192,9 +318,6 @@ impl SmolVLM {
 
         // 5. Get image features
         let mut vision_inputs: HashMap<&str, Value> = HashMap::new();
-        
-        // Convert the processed image tuple into separate values
-        let (processed_image, pixel_attention_mask) = processed_image;
         vision_inputs.insert("pixel_values", Value::from_array(processed_image.clone())?.into());
         
         // Convert attention mask to boolean while maintaining shape (batch, num_frames, height, width)

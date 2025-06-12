@@ -184,9 +184,9 @@ impl SmolVLM {
             text_split_images.push('\n');
         }
 
-        // Add global image section
+        // Add global image section without extra newline
         text_split_images.push_str(&format!(
-            "\n{}{}{}{}",
+            "{}{}{}{}",
             fake_token_around_image,
             global_image_token,
             image_token.repeat(image_seq_len),

@@ -104,6 +104,79 @@ fn test_image_processor_with_large_image() {
     }
 }
 
+#[test]
+fn test_prompt_generation() {
+    // Test parameters
+    let image_rows = 4;
+    let image_cols = 4;
+    let image_seq_len = 169;
+    let fake_token = "<fake_token_around_image>";
+    let image_token = "<image>";
+    let global_image_token = "<global-img>";
+
+    // Generate the prompt
+    let prompt = crate::SmolVLM::get_image_prompt_string(
+        image_rows,
+        image_cols,
+        image_seq_len,
+        fake_token,
+        image_token,
+        global_image_token,
+    );
+
+    // Debug: Print the actual prompt
+    println!("\nActual prompt:");
+    println!("{}", prompt);
+    println!("\nNumber of lines: {}", prompt.lines().count());
+    println!("\nLines:");
+    for (i, line) in prompt.lines().enumerate() {
+        println!("Line {}: {}", i + 1, line);
+    }
+
+    // Expected format for each row
+    let expected_row_format = format!(
+        "{}{}<row_{}_col_{}>{}{}",
+        fake_token,
+        "<row_",
+        "{row}",
+        "{col}",
+        ">",
+        image_token.repeat(image_seq_len)
+    );
+
+    // Verify each row in the grid
+    let lines: Vec<&str> = prompt.lines().collect();
+    assert_eq!(lines.len(), 5, "Expected 5 lines (4 grid rows + 1 global image line), got {}", lines.len());
+
+    // Check each grid row
+    for row in 0..4 {
+        let line = lines[row];
+        for col in 0..4 {
+            let expected = expected_row_format
+                .replace("{row}", &(row + 1).to_string())
+                .replace("{col}", &(col + 1).to_string());
+            assert!(line.contains(&expected), "Row {} col {} not found in line: {}", row + 1, col + 1, line);
+        }
+    }
+
+    // Check global image line
+    let global_line = lines[4];
+    let expected_global = format!(
+        "\n{}{}{}{}",
+        fake_token,
+        global_image_token,
+        image_token.repeat(image_seq_len),
+        fake_token
+    );
+    assert_eq!(global_line, expected_global.trim());
+
+    // Verify total number of image tokens
+    let total_image_tokens = prompt.matches(image_token).count();
+    let expected_total = (image_rows * image_cols + 1) * image_seq_len; // +1 for global image
+    assert_eq!(total_image_tokens, expected_total, 
+        "Expected {} image tokens but found {}", expected_total, total_image_tokens);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

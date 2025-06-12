@@ -167,32 +167,25 @@ impl SmolVLM {
         global_image_token: &str,
     ) -> String {
         let mut text_split_images = String::new();
-        
-        // Create the 4x4 grid
         for n_h in 0..image_rows {
             for n_w in 0..image_cols {
                 text_split_images.push_str(&format!(
-                    "{}{}<row_{}_col_{}>{}{}",
+                    "{}<row_{}_col_{}>{}",
                     fake_token_around_image,
-                    "<row_",
                     n_h + 1,
                     n_w + 1,
-                    ">",
                     image_token.repeat(image_seq_len)
                 ));
             }
             text_split_images.push('\n');
         }
-
-        // Add global image section without extra newline
         text_split_images.push_str(&format!(
-            "{}{}{}{}",
+            "\n{}{}{}{}",
             fake_token_around_image,
             global_image_token,
             image_token.repeat(image_seq_len),
             fake_token_around_image
         ));
-
         text_split_images
     }
 
@@ -205,7 +198,6 @@ impl SmolVLM {
         global_image_token: &str,
     ) -> String {
         if image_rows == 0 && image_cols == 0 {
-            // Single image case
             format!(
                 "{}{}{}{}",
                 fake_token_around_image,
@@ -214,7 +206,6 @@ impl SmolVLM {
                 fake_token_around_image
             )
         } else {
-            // Grid case
             SmolVLM::prompt_split_image(
                 image_seq_len,
                 image_rows,
@@ -237,7 +228,7 @@ impl SmolVLM {
         // Use 4x4 grid (matching our image processor)
         let image_rows = 4;
         let image_cols = 4;
-        let image_seq_len = 169; // Updated to match Python version
+        let image_seq_len = 64; // SmolVLM2 formula: ((512 // 16) ** 2) / (4**2) = 64
         
         println!("Image dimensions: {}x{}", processed_image.shape()[3], processed_image.shape()[4]);
         println!("Pixel attention mask shape: {:?}", pixel_attention_mask.shape());

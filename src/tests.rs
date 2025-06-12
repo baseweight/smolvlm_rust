@@ -177,6 +177,81 @@ fn test_prompt_generation() {
         "Expected {} image tokens but found {}", expected_total, total_image_tokens);
 }
 
+#[test]
+fn test_token_count_for_example_prompt() {
+    let tokenizer_path = std::path::PathBuf::from("tokenizer.json");
+    let processor = tokenizers::Tokenizer::from_file(tokenizer_path).unwrap();
+
+    // Use the same expansion logic as the main code
+    let image_rows = 4;
+    let image_cols = 4;
+    let image_seq_len = 64;
+    let fake_token = "<fake_token_around_image>";
+    let image_token = "<image>";
+    let global_image_token = "<global-img>";
+
+    let image_prompt = crate::SmolVLM::get_image_prompt_string(
+        image_rows,
+        image_cols,
+        image_seq_len,
+        fake_token,
+        image_token,
+        global_image_token,
+    );
+
+    // Use the simpler prompt structure from Python
+    let prompt = format!(
+        "<|im_start|>User:<image>Can you describe this image?<end_of_utterance>\nAssistant:"
+    ).replace("<image>", &image_prompt);
+
+    // Debug output
+    println!("\nPrompt before tokenization:");
+    println!("{}", prompt);
+    let num_image_tokens = prompt.matches("<image>").count();
+    println!("\nNumber of <image> tokens in prompt: {}", num_image_tokens);
+
+    let encoding = processor.encode(prompt, true).unwrap();
+    let input_ids = encoding.get_ids();
+    let num_tokens = input_ids.len();
+    println!("\nToken count: {}", num_tokens);
+    
+    // Print unique tokens and their counts
+    let mut token_counts = std::collections::HashMap::new();
+    for &id in input_ids {
+        *token_counts.entry(id).or_insert(0) += 1;
+    }
+    println!("\nToken distribution:");
+    for (id, count) in token_counts {
+        if let Ok(token) = processor.decode(&[id], true) {
+            println!("Token '{}' (ID: {}): {} occurrences", token, id, count);
+        }
+    }
+
+    // Assert the number of <image> tokens is correct
+    assert_eq!(num_image_tokens, 1088, "Expected 1088 <image> tokens, got {}", num_image_tokens);
+    // Optionally, assert the total token count if you know it
+    // assert_eq!(num_tokens, EXPECTED_TOTAL, "Expected {{}} tokens, got {{}}", EXPECTED_TOTAL, num_tokens);
+}
+
+#[test]
+fn test_tokenizer_image_token_count() {
+    use tokenizers::Tokenizer;
+    let tokenizer = Tokenizer::from_file("tokenizer.json").expect("Failed to load tokenizer");
+    let image_token = "<image>";
+    let image_token_id = tokenizer.token_to_id(image_token).expect("No image token ID");
+    let image_seq_len = 64;
+    let prompt = image_token.repeat(image_seq_len);
+    let encoding = tokenizer.encode(prompt, true).expect("Tokenization failed");
+    let ids = encoding.get_ids();
+    println!("Token IDs: {:?}", ids);
+    for (i, &id) in ids.iter().enumerate() {
+        let decoded = tokenizer.decode(&[id], true).unwrap_or_else(|_| "<decode error>".to_string());
+        println!("Token {}: ID {}: '{}" , i, id, decoded);
+    }
+    assert_eq!(ids.len(), image_seq_len, "Expected {} tokens, got {}", image_seq_len, ids.len());
+    assert!(ids.iter().all(|&id| id == image_token_id), "Not all tokens are <image> token ID");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

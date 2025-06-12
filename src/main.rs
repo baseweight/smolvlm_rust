@@ -5,10 +5,11 @@ mod tests;
 use anyhow::{Result, Context};
 use clap::Parser;
 use image::DynamicImage;
-use ndarray::{Array, Array2, Array4};
+use ndarray::Array;
 use ort::{
     session::{Session, builder::GraphOptimizationLevel},
     value::Value,
+    execution_providers::{CUDAExecutionProvider, ExecutionProvider},
 };
 use reqwest::blocking::Client;
 use std::path::PathBuf;
@@ -16,6 +17,7 @@ use std::fs;
 use std::io::Write;
 use tokenizers::Tokenizer;
 use std::collections::HashMap;
+use rand;
 
 use crate::image_processor::SmolVLMImageProcessor;
 
@@ -38,9 +40,13 @@ struct Args {
     #[arg(long, default_value = "tokenizer.json")]
     tokenizer: PathBuf,
 
-    /// URL of the image to process
-    #[arg(long, default_value = "https://cdn.britannica.com/61/93061-050-99147DCE/Statue-of-Liberty-Island-New-York-Bay.jpg")]
-    image_url: String,
+    /// URL of the image to process (optional)
+    #[arg(long)]
+    image_url: Option<String>,
+
+    /// Path to a local image file (optional)
+    #[arg(long, default_value = "boat.png")]
+    image_path: PathBuf,
 
     /// Prompt to use for generation
     #[arg(long, default_value = "Can you describe this image?")]
@@ -62,6 +68,7 @@ struct SmolVLMConfig {
     num_hidden_layers: usize,
     eos_token_id: u32,
     image_token_id: u32,
+    max_context_length: usize,
 }
 
 impl SmolVLM {
@@ -71,41 +78,40 @@ impl SmolVLM {
         decoder_model_path: &PathBuf,
         tokenizer_path: &PathBuf,
     ) -> Result<Self> {
+        // Check CUDA availability first
+        let cuda = CUDAExecutionProvider::default();
+        match cuda.is_available() {
+            Ok(true) => println!("CUDA is available"),
+            Ok(false) => {
+                println!("CUDA is not available - please ensure CUDA 12 and cuDNN 9.x are installed");
+                std::process::exit(1);
+            },
+            Err(e) => {
+                println!("Error checking CUDA availability: {}", e);
+                std::process::exit(1);
+            }
+        }
+
         let vision_session = Session::builder()?
             .with_optimization_level(GraphOptimizationLevel::Level3)?
+            .with_execution_providers([CUDAExecutionProvider::default().build().error_on_failure()])?
             .commit_from_file(vision_model_path)
             .context("Failed to create vision session")?;
 
         let embed_session = Session::builder()?
             .with_optimization_level(GraphOptimizationLevel::Level3)?
+            .with_execution_providers([CUDAExecutionProvider::default().build().error_on_failure()])?
             .commit_from_file(embed_model_path)
             .context("Failed to create embed session")?;
 
         let decoder_session = Session::builder()?
             .with_optimization_level(GraphOptimizationLevel::Level3)?
+            .with_execution_providers([CUDAExecutionProvider::default().build().error_on_failure()])?
             .commit_from_file(decoder_model_path)
             .context("Failed to create decoder session")?;
 
-        // Get model configuration from the decoder session
-        let config = SmolVLMConfig {
-            num_key_value_heads: 5,  // Match the model's expected number of heads
-            head_dim: 120,          // This needs to match the model's configuration
-            num_hidden_layers: 13,   // This needs to match the model's configuration
-            eos_token_id: 2,
-            image_token_id: 33280,
-        };
-
-        // Debug: Print tokenizer file contents
-        println!("Reading tokenizer file from: {}", tokenizer_path.display());
-        let tokenizer_contents = fs::read_to_string(tokenizer_path)
-            .context("Failed to read tokenizer file")?;
-        println!("Tokenizer file contents (first 1000 chars):\n{}", 
-            tokenizer_contents.chars().take(1000).collect::<String>());
-
         let processor = Tokenizer::from_file(tokenizer_path)
-            .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}\nFile contents preview: {}", 
-                e, 
-                tokenizer_contents.chars().take(1000).collect::<String>()))?;
+            .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
         let image_processor = SmolVLMImageProcessor::new();
 
         // Use configuration that matches the model's expectations
@@ -115,6 +121,7 @@ impl SmolVLM {
             num_hidden_layers: 32,
             eos_token_id: 2,
             image_token_id: 49190,
+            max_context_length: 2048,
         };
 
         Ok(Self {
@@ -127,12 +134,17 @@ impl SmolVLM {
         })
     }
 
-    fn load_image(url: &str) -> Result<DynamicImage> {
-        let client = Client::new();
-        let response = client.get(url).send()?;
-        let image_data = response.bytes()?;
-        let image = image::load_from_memory(&image_data)?;
-        Ok(image)
+    fn load_image(url_or_path: &str) -> Result<DynamicImage> {
+        if url_or_path.starts_with("http://") || url_or_path.starts_with("https://") {
+            let client = Client::new();
+            let response = client.get(url_or_path).send()?;
+            let image_data = response.bytes()?;
+            let image = image::load_from_memory(&image_data)?;
+            Ok(image)
+        } else {
+            let image = image::open(url_or_path)?;
+            Ok(image)
+        }
     }
 
     fn generate(&self, prompt: &str, image: DynamicImage) -> Result<String> {
@@ -156,16 +168,16 @@ impl SmolVLM {
         let attention_mask = encoding.get_attention_mask();
         
         // Convert attention mask to Vec
-        let mut current_attention_mask = attention_mask.iter().map(|&x| x as u32).collect::<Vec<_>>();
-        let mut current_input_ids = input_ids.iter().map(|&x| x as u32).collect::<Vec<_>>();
+        let attention_mask = attention_mask.iter().map(|&x| x as u32).collect::<Vec<_>>();
+        let input_ids = input_ids.iter().map(|&x| x as u32).collect::<Vec<_>>();
         
         // 4. Prepare decoder inputs
         let batch_size = 1;
-        let mut past_key_values = HashMap::new();
+        let mut past_key_values: HashMap<String, Array<f32, _>> = HashMap::new();
         for layer in 0..self.config.num_hidden_layers {
-            // Initialize key and value arrays with correct dimensions
-            let key_array = Array::zeros((batch_size, self.config.num_key_value_heads, 0, self.config.head_dim));
-            let value_array = Array::zeros((batch_size, self.config.num_key_value_heads, 0, self.config.head_dim));
+            // Initialize key and value arrays with dynamic shapes
+            let key_array = Array::zeros((batch_size, self.config.num_key_value_heads, 0, self.config.head_dim)).into_dyn();
+            let value_array = Array::zeros((batch_size, self.config.num_key_value_heads, 0, self.config.head_dim)).into_dyn();
             
             // Insert both key and value arrays
             past_key_values.insert(
@@ -246,7 +258,7 @@ impl SmolVLM {
             let decoder_outputs = self.decoder_session.run(decoder_inputs)?;
             let logits = decoder_outputs[0].try_extract_tensor::<f32>()?.to_owned();
             
-            // Get next token from last position
+            // Get next token from last position - exactly like Python version
             let last_idx = logits.shape()[1] - 1;
             let logits_slice = logits.slice(ndarray::s![0, last_idx, ..]);
             let next_token = logits_slice.iter()
@@ -260,43 +272,29 @@ impl SmolVLM {
             attention_mask = Array::ones((1, 1));
             position_ids = position_ids.slice(ndarray::s![.., -1..]).map(|&x| x + 1);
 
-            // Update past key values - handle each layer's key and value separately
+            // Update past key values
             for i in 0..self.config.num_hidden_layers {
                 let key = format!("past_key_values.{}.key", i);
                 let value = format!("past_key_values.{}.value", i);
                 
                 if let Some(past_key) = past_key_values.get_mut(&key) {
                     let present_key = decoder_outputs[i * 2 + 1].try_extract_tensor::<f32>()?.to_owned();
-                    // Instead of assigning, we need to concatenate along the sequence dimension
-                    let new_shape = (past_key.shape()[0], past_key.shape()[1], past_key.shape()[2] + present_key.shape()[2], past_key.shape()[3]);
-                    let mut new_key = Array::zeros(new_shape);
-                    // Copy existing past key values
-                    new_key.slice_mut(ndarray::s![.., .., ..past_key.shape()[2], ..]).assign(past_key);
-                    // Copy new key values
-                    new_key.slice_mut(ndarray::s![.., .., past_key.shape()[2].., ..]).assign(&present_key);
-                    *past_key = new_key;
+                    let present_key = present_key.into_dyn();
+                    *past_key = present_key;
                 }
                 
                 if let Some(past_value) = past_key_values.get_mut(&value) {
                     let present_value = decoder_outputs[i * 2 + 2].try_extract_tensor::<f32>()?.to_owned();
-                    // Similarly for values, concatenate along sequence dimension
-                    let new_shape = (past_value.shape()[0], past_value.shape()[1], past_value.shape()[2] + present_value.shape()[2], past_value.shape()[3]);
-                    let mut new_value = Array::zeros(new_shape);
-                    // Copy existing past values
-                    new_value.slice_mut(ndarray::s![.., .., ..past_value.shape()[2], ..]).assign(past_value);
-                    // Copy new values
-                    new_value.slice_mut(ndarray::s![.., .., past_value.shape()[2].., ..]).assign(&present_value);
-                    *past_value = new_value;
+                    let present_value = present_value.into_dyn();
+                    *past_value = present_value;
                 }
             }
 
             // Add to generated tokens
             generated_tokens.push(next_token as u32);
-            std::io::stdout().flush()?;  // Ensure the dot is printed immediately
 
             // Check for EOS token
             if next_token == self.config.eos_token_id as i64 {
-                println!("\nGeneration complete!");  // New line after completion
                 break;
             }
 
@@ -344,7 +342,13 @@ fn main() -> Result<()> {
         &args.tokenizer,
     )?;
 
-    let image = SmolVLM::load_image(&args.image_url)?;
+    // Use either the URL or local path for the image
+    let image = if let Some(url) = args.image_url {
+        SmolVLM::load_image(&url)?
+    } else {
+        SmolVLM::load_image(args.image_path.to_str().unwrap())?
+    };
+    
     let response = model.generate(&args.prompt, image)?;
     println!("{}", response);
 

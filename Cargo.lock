@@ -1863,6 +1863,7 @@ dependencies = [
  "ndarray",
  "ndarray-npy",
  "ort",
+ "rand",
  "reqwest",
  "tokenizers",
  "tokio",

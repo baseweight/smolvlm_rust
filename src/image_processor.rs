@@ -145,52 +145,45 @@ impl SmolVLMImageProcessor {
 
         let mut frames = Vec::new();
         
-        // Always do a 4x4 split if image is >= max_size
-        if height >= *max_size || width >= *max_size {
-            // Force 4x4 split
-            let num_splits_h = 4;
-            let num_splits_w = 4;
-            
-            // Calculate optimal split sizes
-            let optimal_height = (height as f32 / num_splits_h as f32).ceil() as u32;
-            let optimal_width = (width as f32 / num_splits_w as f32).ceil() as u32;
+        // Always do a 4x4 split
+        let num_splits_h = 4;
+        let num_splits_w = 4;
+        
+        // Calculate optimal split sizes
+        let optimal_height = (height as f32 / num_splits_h as f32).ceil() as u32;
+        let optimal_width = (width as f32 / num_splits_w as f32).ceil() as u32;
 
-            for r in 0..num_splits_h {
-                for c in 0..num_splits_w {
-                    let start_x = c * optimal_width;
-                    let start_y = r * optimal_height;
-                    let end_x = (start_x + optimal_width).min(width);
-                    let end_y = (start_y + optimal_height).min(height);
+        for r in 0..num_splits_h {
+            for c in 0..num_splits_w {
+                let start_x = c * optimal_width;
+                let start_y = r * optimal_height;
+                let end_x = (start_x + optimal_width).min(width);
+                let end_y = (start_y + optimal_height).min(height);
 
-                    let cropped = image.crop_imm(start_x, start_y, end_x - start_x, end_y - start_y);
-                    // Resize each cropped frame to max_size x max_size
-                    let resized = self.resize(
-                        cropped,
-                        HashMap::from([
-                            ("height".to_string(), *max_size),
-                            ("width".to_string(), *max_size),
-                        ]),
-                    )?;
-                    frames.push(resized);
-                }
+                let cropped = image.crop_imm(start_x, start_y, end_x - start_x, end_y - start_y);
+                // Resize each cropped frame to max_size x max_size
+                let resized = self.resize(
+                    cropped,
+                    HashMap::from([
+                        ("height".to_string(), *max_size),
+                        ("width".to_string(), *max_size),
+                    ]),
+                )?;
+                frames.push(resized);
             }
         }
 
-        // Add the original image, only resize if needed
-        let resized = if height > *max_size || width > *max_size {
-            self.resize(
-                image,
-                HashMap::from([
-                    ("height".to_string(), *max_size),
-                    ("width".to_string(), *max_size),
-                ]),
-            )?
-        } else {
-            image
-        };
+        // Add the original image, resized to max_size
+        let resized = self.resize(
+            image,
+            HashMap::from([
+                ("height".to_string(), *max_size),
+                ("width".to_string(), *max_size),
+            ]),
+        )?;
         frames.push(resized);
 
-        Ok((frames, 4, 4))  // Always return 4x4 for the split dimensions
+        Ok((frames, num_splits_h, num_splits_w))
     }
 
     pub fn preprocess(&self, image: DynamicImage) -> Result<(Array5<f32>, Array4<i64>)> {

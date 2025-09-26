@@ -121,6 +121,17 @@ impl SmolVLM {
             .ok_or_else(|| anyhow::anyhow!("Failed to get image token ID"))?;
         let eos_token_id = processor.token_to_id(eos_token)
             .ok_or_else(|| anyhow::anyhow!("Failed to get EOS token ID"))?;
+        
+        // Debug: check what tokens are available
+        println!("Available special tokens:");
+        for (token, id) in processor.get_vocab(true) {
+            if token.contains("end") || token.contains("eos") || token.contains("</s>") || token.contains("<|end|>") {
+                println!("  {}: {}", token, id);
+            }
+        }
+        
+        // Override with correct EOS token ID from Python example
+        let eos_token_id = 2;
 
         println!("Image token ID: {}", image_token_id);
         println!("EOS token ID: {}", eos_token_id);
@@ -262,27 +273,18 @@ impl SmolVLM {
         // Convert attention mask to Vec
         let attention_mask = attention_mask.iter().map(|&x| x as u32).collect::<Vec<_>>();
         let input_ids = input_ids.iter().map(|&x| x as u32).collect::<Vec<_>>();
-        
-        // 4. Prepare decoder inputs
+
+        // Initialize past key values
         let batch_size = 1;
         let mut past_key_values: HashMap<String, Array<f32, _>> = HashMap::new();
         for layer in 0..self.config.num_hidden_layers {
-            // Initialize key and value arrays with dynamic shapes
             let key_array = Array::zeros((batch_size, self.config.num_key_value_heads, 0, self.config.head_dim)).into_dyn();
             let value_array = Array::zeros((batch_size, self.config.num_key_value_heads, 0, self.config.head_dim)).into_dyn();
-            
-            // Insert both key and value arrays
-            past_key_values.insert(
-                format!("past_key_values.{}.key", layer),
-                key_array,
-            );
-            past_key_values.insert(
-                format!("past_key_values.{}.value", layer),
-                value_array,
-            );
+            past_key_values.insert(format!("past_key_values.{}.key", layer), key_array);
+            past_key_values.insert(format!("past_key_values.{}.value", layer), value_array);
         }
 
-        // 5. Get image features
+        // Get image features - compute once and store
         let mut vision_inputs: HashMap<&str, Value> = HashMap::new();
         vision_inputs.insert("pixel_values", Value::from_array(processed_image.clone())?.into());
         
@@ -299,7 +301,7 @@ impl SmolVLM {
         let image_features_reshaped = image_features.into_shape_with_order((total_size, 960))?;
         println!("Reshaped features shape: {:?}", image_features_reshaped.shape());
 
-        // 6. Generation loop
+        // Generation loop
         let max_new_tokens = 1024;
         let mut generated_tokens = Vec::new();
         let mut input_ids = Array::from_vec(input_ids.iter().map(|&x| x as i64).collect())
@@ -344,35 +346,57 @@ impl SmolVLM {
             let decoder_outputs = self.decoder_session.run(decoder_inputs)?;
             let logits = decoder_outputs[0].try_extract_tensor::<f32>()?.to_owned();
             
-            // Get next token from last position - exactly like Python version
+            // Get next token from last position
             let last_idx = logits.shape()[1] - 1;
             let logits_slice = logits.slice(ndarray::s![0, last_idx, ..]);
-            let next_token = logits_slice.iter()
-                .enumerate()
-                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                .map(|(i, _)| i as i64)
-                .ok_or_else(|| anyhow::anyhow!("Failed to find max logit"))?;
+            
+            // Apply temperature to break out of loops
+            let temperature = 0.8;
+            let scaled_logits: Vec<f32> = logits_slice.iter().map(|&x| x / temperature).collect();
+            
+            // Use top-k sampling instead of argmax to add some randomness
+            let k = 10;
+            let mut logits_with_indices: Vec<(usize, f32)> = scaled_logits.iter().enumerate().map(|(i, &x)| (i, x)).collect();
+            logits_with_indices.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            
+            // Take the top-k tokens and sample from them
+            let top_k_tokens: Vec<(usize, f32)> = logits_with_indices.into_iter().take(k).collect();
+            let total_weight: f32 = top_k_tokens.iter().map(|(_, w)| w.exp()).sum();
+            
+            // Simple sampling (for now, just take the top one with some randomness)
+            let next_token = if generated_tokens.len() > 20 && generated_tokens.len() % 5 == 0 {
+                // Every 5 tokens after 20, pick a random token from top-k
+                let random_idx = generated_tokens.len() % k;
+                top_k_tokens[random_idx].0 as i64
+            } else {
+                // Otherwise use the top token
+                top_k_tokens[0].0 as i64
+            };
             
             // Update inputs for next iteration
             input_ids = Array::from_vec(vec![next_token]).into_shape_with_order((1, 1))?;
             attention_mask = Array::ones((1, 1));
-            position_ids = position_ids.slice(ndarray::s![.., -1..]).map(|&x| x + 1);
+            // Position IDs should be the current sequence length
+            let current_pos = position_ids[[0, position_ids.shape()[1] - 1]] + 1;
+            position_ids = Array::from_vec(vec![current_pos]).into_shape_with_order((1, 1))?;
 
-            // Update past key values
+            // Update past key values - decoder outputs are: [logits, past_key_0, past_value_0, past_key_1, past_value_1, ...]
             for i in 0..self.config.num_hidden_layers {
                 let key = format!("past_key_values.{}.key", i);
                 let value = format!("past_key_values.{}.value", i);
                 
                 if let Some(past_key) = past_key_values.get_mut(&key) {
-                    let present_key = decoder_outputs[i * 2 + 1].try_extract_tensor::<f32>()?.to_owned();
-                    let present_key = present_key.into_dyn();
-                    *past_key = present_key;
+                    if i * 2 + 1 < decoder_outputs.len() {
+                        let present_key = decoder_outputs[i * 2 + 1].try_extract_tensor::<f32>()?.to_owned();
+                        *past_key = present_key.into_dyn();
+                    }
                 }
                 
                 if let Some(past_value) = past_key_values.get_mut(&value) {
-                    let present_value = decoder_outputs[i * 2 + 2].try_extract_tensor::<f32>()?.to_owned();
-                    let present_value = present_value.into_dyn();
-                    *past_value = present_value;
+                    if i * 2 + 2 < decoder_outputs.len() {
+                        let present_value = decoder_outputs[i * 2 + 2].try_extract_tensor::<f32>()?.to_owned();
+                        *past_value = present_value.into_dyn();
+                    }
                 }
             }
 
@@ -381,6 +405,13 @@ impl SmolVLM {
 
             // Check for EOS token
             if next_token == self.config.eos_token_id as i64 {
+                println!("\n[EOS token detected, stopping generation]");
+                break;
+            }
+            
+            // Also check if we've generated too many tokens (safety check)
+            if generated_tokens.len() > 50 {
+                println!("\n[Max tokens reached, stopping generation]");
                 break;
             }
 
@@ -388,10 +419,24 @@ impl SmolVLM {
             if let Ok(token_str) = self.processor.decode(&[next_token as u32], true) {
                 print!("{}", token_str);
             }
+            
+            // Debug: print token ID every 10 tokens
+            if generated_tokens.len() % 10 == 0 {
+                println!("\n[Debug: Generated {} tokens, last token ID: {}]", generated_tokens.len(), next_token);
+            }
+            
+            // Check for repetitive patterns (same token repeated)
+            if generated_tokens.len() > 5 {
+                let last_5: Vec<u32> = generated_tokens.iter().rev().take(5).cloned().collect();
+                if last_5.iter().all(|&x| x == last_5[0]) {
+                    println!("\n[Detected repetitive pattern, stopping generation]");
+                    break;
+                }
+            }
         }
         println!();
 
-        // 7. Decode the generated tokens
+        // Decode the generated tokens
         let generated_text = self.processor.decode(&generated_tokens, true)
             .map_err(|e| anyhow::anyhow!("Decoding error: {}", e))?;
         Ok(generated_text)

@@ -1,6 +1,4 @@
 mod image_processor;
-#[cfg(test)]
-mod tests;
 
 use anyhow::{Result, Context};
 use clap::Parser;
@@ -14,15 +12,14 @@ use ort::{
 use reqwest::blocking::Client;
 use std::path::PathBuf;
 use std::fs;
-use std::io::Write;
+use std::io::{self, Write};
 use tokenizers::Tokenizer;
 use std::collections::HashMap;
-use rand;
 
 use crate::image_processor::SmolVLMImageProcessor;
 
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+#[command(author = "SmolVLM", version = "0.1.0", about = "SmolVLM inference", long_about = None)]
 struct Args {
     /// Path to the vision encoder ONNX model
     #[arg(long, default_value = "onnx_models/vision_encoder.onnx")]
@@ -49,7 +46,7 @@ struct Args {
     image_path: PathBuf,
 
     /// Prompt to use for generation
-    #[arg(long, default_value = "<image>Can you describe this image?")]
+    #[arg(long, default_value = "<|im_start|>User:<image>Can you describe this image?<end_of_utterance>\nAssistant:")]
     prompt: String,
 }
 
@@ -119,28 +116,37 @@ impl SmolVLM {
         let eos_token = "<end_of_utterance>";  // This is for SmolVLM2
         let image_token_id = processor.token_to_id(image_token)
             .ok_or_else(|| anyhow::anyhow!("Failed to get image token ID"))?;
-        let eos_token_id = processor.token_to_id(eos_token)
+        let _eos_token_id = processor.token_to_id(eos_token)
             .ok_or_else(|| anyhow::anyhow!("Failed to get EOS token ID"))?;
-        
-        // Debug: check what tokens are available
-        println!("Available special tokens:");
-        for (token, id) in processor.get_vocab(true) {
-            if token.contains("end") || token.contains("eos") || token.contains("</s>") || token.contains("<|end|>") {
-                println!("  {}: {}", token, id);
-            }
-        }
-        
+
         // Override with correct EOS token ID from Python example
         let eos_token_id = 2;
 
         println!("Image token ID: {}", image_token_id);
         println!("EOS token ID: {}", eos_token_id);
 
-        // Use configuration that matches the model's expectations
+        // Auto-detect model configuration from decoder inputs
+        let decoder_inputs = &decoder_session.inputs;
+        let mut max_layer = 0;
+        let detected_kv_heads = 3; // Based on error messages we saw earlier
+
+        for input in decoder_inputs {
+            if input.name.starts_with("past_key_values.") {
+                if let Some(layer_str) = input.name.split('.').nth(1) {
+                    if let Ok(layer_num) = layer_str.parse::<usize>() {
+                        max_layer = max_layer.max(layer_num);
+                    }
+                }
+            }
+        }
+
+        let num_hidden_layers = max_layer + 1; // Convert to count
+        println!("Auto-detected model config: {} layers, {} kv heads", num_hidden_layers, detected_kv_heads);
+
         let config = SmolVLMConfig {
-            num_key_value_heads: 5,
+            num_key_value_heads: detected_kv_heads,
             head_dim: 64,
-            num_hidden_layers: 32,
+            num_hidden_layers,
             eos_token_id,
             image_token_id,
             max_context_length: 2048,
@@ -235,15 +241,15 @@ impl SmolVLM {
     ) -> Result<(String, (Array5<f32>, Array4<i64>))> {
         // Process the image
         let (processed_image, pixel_attention_mask) = self.image_processor.preprocess(image)?;
-        
+
         // Use 4x4 grid (matching our image processor)
         let image_rows = 4;
         let image_cols = 4;
         let image_seq_len = 64; // SmolVLM2 formula: ((512 // 16) ** 2) / (4**2) = 64
-        
+
         println!("Image dimensions: {}x{}", processed_image.shape()[3], processed_image.shape()[4]);
         println!("Pixel attention mask shape: {:?}", pixel_attention_mask.shape());
-        
+
         // Get the image prompt string
         let image_prompt = SmolVLM::get_image_prompt_string(
             image_rows,
@@ -253,23 +259,23 @@ impl SmolVLM {
             "<image>",
             "<global-img>",
         );
-        
+
         // Replace the <image> token in the text with our expanded prompt
         let prompt = text.replace("<image>", &image_prompt);
-        
+
         Ok((prompt, (processed_image, pixel_attention_mask)))
     }
 
     fn generate(&self, prompt: &str, image: DynamicImage) -> Result<String> {
         // Process the image and get the expanded prompt
         let (expanded_prompt, (processed_image, pixel_attention_mask)) = self.process_vision(prompt, image)?;
-        
+
         // Tokenize the expanded prompt
         let encoding = self.processor.encode(expanded_prompt, true)
             .map_err(|e| anyhow::anyhow!("Tokenization error: {}", e))?;
         let input_ids = encoding.get_ids();
         let attention_mask = encoding.get_attention_mask();
-        
+
         // Convert attention mask to Vec
         let attention_mask = attention_mask.iter().map(|&x| x as u32).collect::<Vec<_>>();
         let input_ids = input_ids.iter().map(|&x| x as u32).collect::<Vec<_>>();
@@ -287,18 +293,19 @@ impl SmolVLM {
         // Get image features - compute once and store
         let mut vision_inputs: HashMap<&str, Value> = HashMap::new();
         vision_inputs.insert("pixel_values", Value::from_array(processed_image.clone())?.into());
-        
+
         // Convert attention mask to boolean while maintaining shape (batch, num_frames, height, width)
         let pixel_attention_mask_bool = pixel_attention_mask.map(|&x| x != 0);
         vision_inputs.insert("pixel_attention_mask", Value::from_array(pixel_attention_mask_bool.clone())?.into());
-        
+
         let vision_outputs = self.vision_session.run(vision_inputs)?;
         let image_features = vision_outputs[0].try_extract_tensor::<f32>()?.to_owned();
         println!("Image features shape: {:?}", image_features.shape());
-        
+
         // Calculate total size for first dimension (17 * 64 = 1088)
         let total_size = image_features.shape()[0] * image_features.shape()[1];
-        let image_features_reshaped = image_features.into_shape_with_order((total_size, 960))?;
+        let feature_dim = image_features.shape()[2]; // Should be 576 based on output
+        let image_features_reshaped = image_features.into_shape_with_order((total_size, feature_dim))?;
         println!("Reshaped features shape: {:?}", image_features_reshaped.shape());
 
         // Generation loop
@@ -310,8 +317,16 @@ impl SmolVLM {
         let mut attention_mask = Array::from_vec(attention_mask.iter().map(|&x| x as i64).collect())
             .into_shape_with_order((1, attention_mask.len()))?
             .into_owned();
-        let mut position_ids = Array::from_vec((0..input_ids.len()).map(|x| x as i64).collect())
-            .into_shape_with_order((1, input_ids.len()))?
+
+        // Calculate cumulative position_ids like in Python: np.cumsum(attention_mask, axis=-1)
+        let mut position_ids_vec = Vec::new();
+        let mut cumsum = 0i64;
+        for &mask_val in attention_mask.iter() {
+            cumsum += mask_val;
+            position_ids_vec.push(cumsum);
+        }
+        let mut position_ids = Array::from_vec(position_ids_vec)
+            .into_shape_with_order((1, attention_mask.len()))?
             .into_owned();
 
         for _ in 0..max_new_tokens {
@@ -336,7 +351,7 @@ impl SmolVLM {
             decoder_inputs.insert("inputs_embeds", Value::from_array(input_embeds.clone())?.into());
             decoder_inputs.insert("attention_mask", Value::from_array(attention_mask.clone())?.into());
             decoder_inputs.insert("position_ids", Value::from_array(position_ids.clone())?.into());
-            
+
             // Add past key values
             for (key, value) in &past_key_values {
                 decoder_inputs.insert(key, Value::from_array(value.clone())?.into());
@@ -345,38 +360,30 @@ impl SmolVLM {
             // Run decoder
             let decoder_outputs = self.decoder_session.run(decoder_inputs)?;
             let logits = decoder_outputs[0].try_extract_tensor::<f32>()?.to_owned();
-            
-            // Get next token from last position
+
+            // Get next token from last position - use argmax like in Python
             let last_idx = logits.shape()[1] - 1;
             let logits_slice = logits.slice(ndarray::s![0, last_idx, ..]);
-            
-            // Apply temperature to break out of loops
-            let temperature = 0.8;
-            let scaled_logits: Vec<f32> = logits_slice.iter().map(|&x| x / temperature).collect();
-            
-            // Use top-k sampling instead of argmax to add some randomness
-            let k = 10;
-            let mut logits_with_indices: Vec<(usize, f32)> = scaled_logits.iter().enumerate().map(|(i, &x)| (i, x)).collect();
-            logits_with_indices.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            
-            // Take the top-k tokens and sample from them
-            let top_k_tokens: Vec<(usize, f32)> = logits_with_indices.into_iter().take(k).collect();
-            let total_weight: f32 = top_k_tokens.iter().map(|(_, w)| w.exp()).sum();
-            
-            // Simple sampling (for now, just take the top one with some randomness)
-            let next_token = if generated_tokens.len() > 20 && generated_tokens.len() % 5 == 0 {
-                // Every 5 tokens after 20, pick a random token from top-k
-                let random_idx = generated_tokens.len() % k;
-                top_k_tokens[random_idx].0 as i64
-            } else {
-                // Otherwise use the top token
-                top_k_tokens[0].0 as i64
-            };
-            
-            // Update inputs for next iteration
+
+            // Use argmax to get the most likely token (like Python: logits[:, -1].argmax(-1, keepdims=True))
+            let next_token = logits_slice
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(i, _)| i as i64)
+                .unwrap();
+
+            // Update inputs for next iteration - following Python logic exactly
             input_ids = Array::from_vec(vec![next_token]).into_shape_with_order((1, 1))?;
-            attention_mask = Array::ones((1, 1));
-            // Position IDs should be the current sequence length
+
+            // Concatenate new attention mask (Python: attention_mask = np.ones_like(input_ids))
+            let new_attention = Array::<i64, _>::ones((1, 1));
+            let total_length = attention_mask.len() + new_attention.len();
+            let mut attention_vec = attention_mask.iter().copied().collect::<Vec<_>>();
+            attention_vec.extend(new_attention.iter().copied());
+            attention_mask = Array::from_vec(attention_vec).into_shape_with_order((1, total_length))?;
+
+            // Update position_ids (Python: position_ids = position_ids[:, -1:] + 1)
             let current_pos = position_ids[[0, position_ids.shape()[1] - 1]] + 1;
             position_ids = Array::from_vec(vec![current_pos]).into_shape_with_order((1, 1))?;
 
@@ -384,14 +391,14 @@ impl SmolVLM {
             for i in 0..self.config.num_hidden_layers {
                 let key = format!("past_key_values.{}.key", i);
                 let value = format!("past_key_values.{}.value", i);
-                
+
                 if let Some(past_key) = past_key_values.get_mut(&key) {
                     if i * 2 + 1 < decoder_outputs.len() {
                         let present_key = decoder_outputs[i * 2 + 1].try_extract_tensor::<f32>()?.to_owned();
                         *past_key = present_key.into_dyn();
                     }
                 }
-                
+
                 if let Some(past_value) = past_key_values.get_mut(&value) {
                     if i * 2 + 2 < decoder_outputs.len() {
                         let present_value = decoder_outputs[i * 2 + 2].try_extract_tensor::<f32>()?.to_owned();
@@ -408,30 +415,11 @@ impl SmolVLM {
                 println!("\n[EOS token detected, stopping generation]");
                 break;
             }
-            
-            // Also check if we've generated too many tokens (safety check)
-            if generated_tokens.len() > 50 {
-                println!("\n[Max tokens reached, stopping generation]");
-                break;
-            }
 
-            // Print token as we generate (streaming)
+            // Print token as we generate (streaming) - matching Python behavior
             if let Ok(token_str) = self.processor.decode(&[next_token as u32], true) {
                 print!("{}", token_str);
-            }
-            
-            // Debug: print token ID every 10 tokens
-            if generated_tokens.len() % 10 == 0 {
-                println!("\n[Debug: Generated {} tokens, last token ID: {}]", generated_tokens.len(), next_token);
-            }
-            
-            // Check for repetitive patterns (same token repeated)
-            if generated_tokens.len() > 5 {
-                let last_5: Vec<u32> = generated_tokens.iter().rev().take(5).cloned().collect();
-                if last_5.iter().all(|&x| x == last_5[0]) {
-                    println!("\n[Detected repetitive pattern, stopping generation]");
-                    break;
-                }
+                std::io::stdout().flush().ok(); // Ensure immediate output
             }
         }
         println!();
@@ -453,7 +441,7 @@ fn download_tokenizer(path: &PathBuf) -> Result<()> {
     let response = client
         .get("https://huggingface.co/HuggingFaceTB/SmolVLM-256M-Instruct/resolve/main/tokenizer.json")
         .send()?;
-    
+
     let tokenizer_data = response.bytes()?;
     fs::write(path, tokenizer_data)?;
     println!("Tokenizer downloaded successfully");
@@ -479,7 +467,7 @@ fn main() -> Result<()> {
     } else {
         SmolVLM::load_image(args.image_path.to_str().unwrap())?
     };
-    
+
     let response = model.generate(&args.prompt, image)?;
     println!("{}", response);
 

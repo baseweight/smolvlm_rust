@@ -3,12 +3,21 @@ name = "smolvlm"
 version = "0.1.0"
 edition = "2024"
 
+# Conditional ONNX Runtime features based on platform
+[target.'cfg(target_os = "windows")'.dependencies]
+ort = { version = "=2.0.0-rc.9", features = ["directml", "download-binaries"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ort = { version = "=2.0.0-rc.9", features = ["cuda", "download-binaries"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+ort = { version = "=2.0.0-rc.9", features = ["coreml", "download-binaries"] }
+
 [dependencies]
-ort = { version = "=2.0.0-rc.9", features = ["cuda"] }
 image = "0.24"
 clap = { version = "4.4", features = ["derive"] }
 ndarray = "0.16.1"
-tokenizers = { version = "0.21.1" }
+tokenizers = { version = "0.22.1" }
 anyhow       = "1.0"
 tokio        = { version = "1", features = ["rt-multi-thread","macros"] }
 reqwest      = { version = "0.11", features = ["json","blocking"] }

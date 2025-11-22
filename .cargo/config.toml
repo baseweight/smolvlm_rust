@@ -1,0 +1,9 @@
+# Windows-specific configuration to resolve DirectML + tokenizers linking conflict
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "link-arg=/MD"]
+
+# Force onig_sys and other C dependencies to use dynamic CRT
+# This applies to all platforms but is primarily needed for Windows
+[env]
+CFLAGS = "/MD"
+CXXFLAGS = "/MD"

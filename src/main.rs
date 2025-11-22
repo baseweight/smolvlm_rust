@@ -7,8 +7,17 @@ use ndarray::{Array, Array4, Array5};
 use ort::{
     session::{Session, builder::GraphOptimizationLevel},
     value::Value,
-    execution_providers::{CUDAExecutionProvider, ExecutionProvider},
+    execution_providers::ExecutionProvider,
 };
+
+#[cfg(target_os = "windows")]
+use ort::execution_providers::DirectMLExecutionProvider;
+
+#[cfg(target_os = "linux")]
+use ort::execution_providers::CUDAExecutionProvider;
+
+#[cfg(target_os = "macos")]
+use ort::execution_providers::CoreMLExecutionProvider;
 use reqwest::blocking::Client;
 use std::path::PathBuf;
 use std::fs;
@@ -22,15 +31,15 @@ use crate::image_processor::SmolVLMImageProcessor;
 #[command(author = "SmolVLM", version = "0.1.0", about = "SmolVLM inference", long_about = None)]
 struct Args {
     /// Path to the vision encoder ONNX model
-    #[arg(long, default_value = "onnx_models/vision_encoder.onnx")]
+    #[arg(long, default_value = "onnx_models/vision_encoder_q4.onnx")]
     vision_model: PathBuf,
 
     /// Path to the token embedding ONNX model
-    #[arg(long, default_value = "onnx_models/embed_tokens.onnx")]
+    #[arg(long, default_value = "onnx_models/embed_tokens_q4.onnx")]
     embed_model: PathBuf,
 
     /// Path to the decoder ONNX model
-    #[arg(long, default_value = "onnx_models/decoder_model_merged.onnx")]
+    #[arg(long, default_value = "onnx_models/decoder_model_merged_q4.onnx")]
     decoder_model: PathBuf,
 
     /// Path to the tokenizer file
@@ -75,35 +84,116 @@ impl SmolVLM {
         decoder_model_path: &PathBuf,
         tokenizer_path: &PathBuf,
     ) -> Result<Self> {
-        // Check CUDA availability first
-        let cuda = CUDAExecutionProvider::default();
-        match cuda.is_available() {
-            Ok(true) => println!("CUDA is available"),
-            Ok(false) => {
-                println!("CUDA is not available - please ensure CUDA 12 and cuDNN 9.x are installed");
-                std::process::exit(1);
-            },
-            Err(e) => {
-                println!("Error checking CUDA availability: {}", e);
-                std::process::exit(1);
+        // Check GPU availability based on platform
+        #[cfg(target_os = "windows")]
+        {
+            let provider = DirectMLExecutionProvider::default();
+            match provider.is_available() {
+                Ok(true) => println!("DirectML is available"),
+                Ok(false) => {
+                    println!("DirectML is not available - please ensure you have DirectX 12 support");
+                    std::process::exit(1);
+                },
+                Err(e) => {
+                    println!("Error checking DirectML availability: {}", e);
+                    std::process::exit(1);
+                }
             }
         }
 
+        #[cfg(target_os = "linux")]
+        {
+            let provider = CUDAExecutionProvider::default();
+            match provider.is_available() {
+                Ok(true) => println!("CUDA is available"),
+                Ok(false) => {
+                    println!("CUDA is not available - please ensure CUDA 12+ and cuDNN are installed");
+                    std::process::exit(1);
+                },
+                Err(e) => {
+                    println!("Error checking CUDA availability: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let provider = CoreMLExecutionProvider::default();
+            match provider.is_available() {
+                Ok(true) => println!("CoreML is available"),
+                Ok(false) => {
+                    println!("CoreML is not available");
+                    std::process::exit(1);
+                },
+                Err(e) => {
+                    println!("Error checking CoreML availability: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        // Create sessions with platform-specific execution providers
+        #[cfg(target_os = "windows")]
+        let vision_session = Session::builder()?
+            .with_optimization_level(GraphOptimizationLevel::Level3)?
+            .with_execution_providers([DirectMLExecutionProvider::default().build().error_on_failure()])?
+            .commit_from_file(vision_model_path)
+            .context("Failed to create vision session")?;
+
+        #[cfg(target_os = "linux")]
         let vision_session = Session::builder()?
             .with_optimization_level(GraphOptimizationLevel::Level3)?
             .with_execution_providers([CUDAExecutionProvider::default().build().error_on_failure()])?
             .commit_from_file(vision_model_path)
             .context("Failed to create vision session")?;
 
+        #[cfg(target_os = "macos")]
+        let vision_session = Session::builder()?
+            .with_optimization_level(GraphOptimizationLevel::Level3)?
+            .with_execution_providers([CoreMLExecutionProvider::default().build().error_on_failure()])?
+            .commit_from_file(vision_model_path)
+            .context("Failed to create vision session")?;
+
+        #[cfg(target_os = "windows")]
+        let embed_session = Session::builder()?
+            .with_optimization_level(GraphOptimizationLevel::Level3)?
+            .with_execution_providers([DirectMLExecutionProvider::default().build().error_on_failure()])?
+            .commit_from_file(embed_model_path)
+            .context("Failed to create embed session")?;
+
+        #[cfg(target_os = "linux")]
         let embed_session = Session::builder()?
             .with_optimization_level(GraphOptimizationLevel::Level3)?
             .with_execution_providers([CUDAExecutionProvider::default().build().error_on_failure()])?
             .commit_from_file(embed_model_path)
             .context("Failed to create embed session")?;
 
+        #[cfg(target_os = "macos")]
+        let embed_session = Session::builder()?
+            .with_optimization_level(GraphOptimizationLevel::Level3)?
+            .with_execution_providers([CoreMLExecutionProvider::default().build().error_on_failure()])?
+            .commit_from_file(embed_model_path)
+            .context("Failed to create embed session")?;
+
+        #[cfg(target_os = "windows")]
+        let decoder_session = Session::builder()?
+            .with_optimization_level(GraphOptimizationLevel::Level3)?
+            .with_execution_providers([DirectMLExecutionProvider::default().build().error_on_failure()])?
+            .commit_from_file(decoder_model_path)
+            .context("Failed to create decoder session")?;
+
+        #[cfg(target_os = "linux")]
         let decoder_session = Session::builder()?
             .with_optimization_level(GraphOptimizationLevel::Level3)?
             .with_execution_providers([CUDAExecutionProvider::default().build().error_on_failure()])?
+            .commit_from_file(decoder_model_path)
+            .context("Failed to create decoder session")?;
+
+        #[cfg(target_os = "macos")]
+        let decoder_session = Session::builder()?
+            .with_optimization_level(GraphOptimizationLevel::Level3)?
+            .with_execution_providers([CoreMLExecutionProvider::default().build().error_on_failure()])?
             .commit_from_file(decoder_model_path)
             .context("Failed to create decoder session")?;
 
@@ -128,7 +218,7 @@ impl SmolVLM {
         // Auto-detect model configuration from decoder inputs
         let decoder_inputs = &decoder_session.inputs;
         let mut max_layer = 0;
-        let detected_kv_heads = 3; // Based on error messages we saw earlier
+        let detected_kv_heads = 5; // Based on decoder model requirements
 
         for input in decoder_inputs {
             if input.name.starts_with("past_key_values.") {

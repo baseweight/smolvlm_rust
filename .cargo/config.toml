@@ -1,14 +1,19 @@
 # Windows-specific configuration to resolve DirectML + tokenizers linking conflict
 [target.x86_64-pc-windows-msvc]
-rustflags = ["-C", "link-arg=/MD"]
+# Don't pass /MD to linker - it needs to go to the compiler
 
-# Windows-specific environment for C/C++ dependencies
-[target.x86_64-pc-windows-msvc.env]
+# Force dynamic CRT linking for all C/C++ dependencies
+[env]
+# Global C/C++ flags
 CFLAGS = "/MD"
 CXXFLAGS = "/MD"
+# Target-specific flags that cc crate respects
+CFLAGS_x86_64-pc-windows-msvc = "/MD"
+CXXFLAGS_x86_64-pc-windows-msvc = "/MD"
+CFLAGS_x86_64_pc_windows_msvc = "/MD"
+CXXFLAGS_x86_64_pc_windows_msvc = "/MD"
 
-# Disable pkg-config for ONNX Runtime to use downloaded binaries with CoreML support
-[env]
+# Disable pkg-config for ONNX Runtime to use downloaded binaries
 ORT_USE_SYSTEM_LIB = "0"
 PKG_CONFIG_PATH = ""
 ORT_STRATEGY = "download"

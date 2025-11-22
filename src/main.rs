@@ -25,7 +25,7 @@ use ort::execution_providers::CoreMLExecutionProvider;
 use reqwest::blocking::Client;
 use std::path::PathBuf;
 use std::fs;
-use std::io::{self, Write};
+use std::io::Write;
 use tokenizers::Tokenizer;
 use std::collections::HashMap;
 
@@ -400,7 +400,7 @@ impl SmolVLM {
         Ok((prompt, (processed_image, pixel_attention_mask)))
     }
 
-    fn generate(&self, prompt: &str, image: DynamicImage) -> Result<String> {
+    fn generate(&mut self, prompt: &str, image: DynamicImage) -> Result<String> {
         // Process the image and get the expanded prompt
         let (expanded_prompt, (processed_image, pixel_attention_mask)) = self.process_vision(prompt, image)?;
 
@@ -433,7 +433,7 @@ impl SmolVLM {
         vision_inputs.insert("pixel_attention_mask", Value::from_array(pixel_attention_mask_bool.clone())?.into());
 
         let vision_outputs = self.vision_session.run(vision_inputs)?;
-        let image_features = vision_outputs[0].try_extract_tensor::<f32>()?.to_owned();
+        let image_features = vision_outputs[0].try_extract_array::<f32>()?.to_owned();
         println!("Image features shape: {:?}", image_features.shape());
 
         // Calculate total size for first dimension (17 * 64 = 1088)
@@ -468,7 +468,7 @@ impl SmolVLM {
             let mut embed_inputs: HashMap<&str, Value> = HashMap::new();
             embed_inputs.insert("input_ids", Value::from_array(input_ids.clone())?.into());
             let embed_outputs = self.embed_session.run(embed_inputs)?;
-            let mut input_embeds = embed_outputs[0].try_extract_tensor::<f32>()?.to_owned();
+            let mut input_embeds = embed_outputs[0].try_extract_array::<f32>()?.to_owned();
 
             // Replace image token embeddings with image features
             let mut feature_idx = 0;
@@ -493,7 +493,7 @@ impl SmolVLM {
 
             // Run decoder
             let decoder_outputs = self.decoder_session.run(decoder_inputs)?;
-            let logits = decoder_outputs[0].try_extract_tensor::<f32>()?.to_owned();
+            let logits = decoder_outputs[0].try_extract_array::<f32>()?.to_owned();
 
             // Get next token from last position - use argmax like in Python
             let last_idx = logits.shape()[1] - 1;
@@ -528,14 +528,14 @@ impl SmolVLM {
 
                 if let Some(past_key) = past_key_values.get_mut(&key) {
                     if i * 2 + 1 < decoder_outputs.len() {
-                        let present_key = decoder_outputs[i * 2 + 1].try_extract_tensor::<f32>()?.to_owned();
+                        let present_key = decoder_outputs[i * 2 + 1].try_extract_array::<f32>()?.to_owned();
                         *past_key = present_key.into_dyn();
                     }
                 }
 
                 if let Some(past_value) = past_key_values.get_mut(&value) {
                     if i * 2 + 2 < decoder_outputs.len() {
-                        let present_value = decoder_outputs[i * 2 + 2].try_extract_tensor::<f32>()?.to_owned();
+                        let present_value = decoder_outputs[i * 2 + 2].try_extract_array::<f32>()?.to_owned();
                         *past_value = present_value.into_dyn();
                     }
                 }
@@ -588,7 +588,7 @@ fn main() -> Result<()> {
     // Download tokenizer if it doesn't exist
     download_tokenizer(&args.tokenizer)?;
 
-    let model = SmolVLM::new(
+    let mut model = SmolVLM::new(
         &args.vision_model,
         &args.embed_model,
         &args.decoder_model,

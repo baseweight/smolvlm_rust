@@ -2,8 +2,13 @@
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "link-arg=/MD"]
 
-# Force onig_sys and other C dependencies to use dynamic CRT
-# This applies to all platforms but is primarily needed for Windows
-[env]
+# Windows-specific environment for C/C++ dependencies
+[target.x86_64-pc-windows-msvc.env]
 CFLAGS = "/MD"
 CXXFLAGS = "/MD"
+
+# Disable pkg-config for ONNX Runtime to use downloaded binaries with CoreML support
+[env]
+ORT_USE_SYSTEM_LIB = "0"
+PKG_CONFIG_PATH = ""
+ORT_STRATEGY = "download"

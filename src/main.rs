@@ -18,6 +18,10 @@ use ort::execution_providers::CUDAExecutionProvider;
 
 #[cfg(target_os = "macos")]
 use ort::execution_providers::CoreMLExecutionProvider;
+
+#[cfg(target_os = "ios")]
+use ort::execution_providers::CoreMLExecutionProvider;
+
 use reqwest::blocking::Client;
 use std::path::PathBuf;
 use std::fs;
@@ -133,6 +137,22 @@ impl SmolVLM {
             }
         }
 
+        #[cfg(target_os = "ios")]
+        {
+            let provider = CoreMLExecutionProvider::default();
+            match provider.is_available() {
+                Ok(true) => println!("CoreML is available on iOS"),
+                Ok(false) => {
+                    println!("CoreML is not available on iOS");
+                    std::process::exit(1);
+                },
+                Err(e) => {
+                    println!("Error checking CoreML availability on iOS: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+
         // Create sessions with platform-specific execution providers
         #[cfg(target_os = "windows")]
         let vision_session = Session::builder()?
@@ -151,6 +171,14 @@ impl SmolVLM {
         #[cfg(target_os = "macos")]
         let vision_session = Session::builder()?
             .with_optimization_level(GraphOptimizationLevel::Level3)?
+            // Temporarily using CPU only - CoreML has compatibility issues with these models
+            // .with_execution_providers([CoreMLExecutionProvider::default().build()])?
+            .commit_from_file(vision_model_path)
+            .context("Failed to create vision session")?;
+
+        #[cfg(target_os = "ios")]
+        let vision_session = Session::builder()?
+            .with_optimization_level(GraphOptimizationLevel::Level3)?
             .with_execution_providers([CoreMLExecutionProvider::default().build().error_on_failure()])?
             .commit_from_file(vision_model_path)
             .context("Failed to create vision session")?;
@@ -172,6 +200,14 @@ impl SmolVLM {
         #[cfg(target_os = "macos")]
         let embed_session = Session::builder()?
             .with_optimization_level(GraphOptimizationLevel::Level3)?
+            // Temporarily using CPU only - CoreML has compatibility issues with these models
+            // .with_execution_providers([CoreMLExecutionProvider::default().build()])?
+            .commit_from_file(embed_model_path)
+            .context("Failed to create embed session")?;
+
+        #[cfg(target_os = "ios")]
+        let embed_session = Session::builder()?
+            .with_optimization_level(GraphOptimizationLevel::Level3)?
             .with_execution_providers([CoreMLExecutionProvider::default().build().error_on_failure()])?
             .commit_from_file(embed_model_path)
             .context("Failed to create embed session")?;
@@ -191,6 +227,14 @@ impl SmolVLM {
             .context("Failed to create decoder session")?;
 
         #[cfg(target_os = "macos")]
+        let decoder_session = Session::builder()?
+            .with_optimization_level(GraphOptimizationLevel::Level3)?
+            // Temporarily using CPU only - CoreML has compatibility issues with these models
+            // .with_execution_providers([CoreMLExecutionProvider::default().build()])?
+            .commit_from_file(decoder_model_path)
+            .context("Failed to create decoder session")?;
+
+        #[cfg(target_os = "ios")]
         let decoder_session = Session::builder()?
             .with_optimization_level(GraphOptimizationLevel::Level3)?
             .with_execution_providers([CoreMLExecutionProvider::default().build().error_on_failure()])?
